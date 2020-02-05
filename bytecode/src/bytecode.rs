@@ -45,6 +45,7 @@ pub struct CodeObject {
     pub source_path: String,
     pub first_line_number: usize,
     pub obj_name: String, // Name of the object that created this code object
+    pub incognito: bool,
 }
 
 bitflags! {
@@ -390,6 +391,7 @@ impl CodeObject {
             source_path,
             first_line_number,
             obj_name,
+            incognito: false,
         }
     }
 
