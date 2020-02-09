@@ -45,18 +45,18 @@ pub struct CodeObject {
     pub source_path: String,
     pub first_line_number: usize,
     pub obj_name: String, // Name of the object that created this code object
-    pub incognito: bool,
 }
 
 bitflags! {
     #[derive(Serialize, Deserialize)]
-    pub struct CodeFlags: u8 {
+    pub struct CodeFlags: u16 {
         const HAS_DEFAULTS = 0x01;
         const HAS_KW_ONLY_DEFAULTS = 0x02;
         const HAS_ANNOTATIONS = 0x04;
         const NEW_LOCALS = 0x08;
         const IS_GENERATOR = 0x10;
         const IS_COROUTINE = 0x20;
+        const INCOGNITO = 1 << 15;
     }
 }
 
@@ -391,7 +391,6 @@ impl CodeObject {
             source_path,
             first_line_number,
             obj_name,
-            incognito: false,
         }
     }
 
@@ -447,6 +446,10 @@ impl CodeObject {
             }
         }
         Display(self)
+    }
+
+    pub fn incognito(&self) -> bool {
+        self.flags.contains(CodeFlags::INCOGNITO)
     }
 }
 
