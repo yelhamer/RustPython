@@ -43,41 +43,113 @@ use crate::pyobject::{
 use crate::vm::VirtualMachine;
 
 #[cfg(unix)]
-pub fn raw_file_number(handle: File) -> i64 {
+pub fn raw_file_number(handle: File, _flags: i32, _vm: &VirtualMachine) -> PyResult<i32> {
     use std::os::unix::io::IntoRawFd;
-
-    i64::from(handle.into_raw_fd())
+    Ok(handle.into_raw_fd())
 }
 
 #[cfg(unix)]
-pub fn rust_file(raw_fileno: i64) -> File {
+pub fn rust_file(raw_fileno: i32, _vm: &VirtualMachine) -> PyResult<File> {
     use std::os::unix::io::FromRawFd;
+    Ok(unsafe { File::from_raw_fd(raw_fileno) })
+}
 
-    unsafe { File::from_raw_fd(raw_fileno as i32) }
+#[cfg(unix)]
+pub fn forget_file(handle: File) {
+    use std::os::unix::io::IntoRawFd;
+    handle.into_raw_fd();
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+type InvalidParamHandler = extern "C" fn(
+    *const libc::wchar_t,
+    *const libc::wchar_t,
+    *const libc::wchar_t,
+    libc::c_uint,
+    libc::uintptr_t,
+);
+#[cfg(all(windows, target_env = "msvc"))]
+extern "C" {
+    fn _set_thread_local_invalid_parameter_handler(
+        pNew: InvalidParamHandler,
+    ) -> InvalidParamHandler;
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+extern "C" fn silent_iph_handler(
+    _: *const libc::wchar_t,
+    _: *const libc::wchar_t,
+    _: *const libc::wchar_t,
+    _: libc::c_uint,
+    _: libc::uintptr_t,
+) {
+}
+
+macro_rules! suppress_iph {
+    ($e:expr) => {{
+        #[cfg(all(windows, target_env = "msvc"))]
+        {
+            let old = _set_thread_local_invalid_parameter_handler(silent_iph_handler);
+            let ret = $e;
+            _set_thread_local_invalid_parameter_handler(old);
+            ret
+        }
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        {
+            $e
+        }
+    }};
 }
 
 #[cfg(windows)]
-pub fn raw_file_number(handle: File) -> i64 {
+pub fn raw_file_number(handle: File, flags: i32, vm: &VirtualMachine) -> PyResult<i32> {
     use std::os::windows::io::IntoRawHandle;
-
-    handle.into_raw_handle() as i64
+    extern "C" {
+        fn _open_osfhandle(handle: isize /* intptr_t */, flags: i32) -> i32;
+    }
+    let handle = handle.into_raw_handle();
+    let res = unsafe { suppress_iph!(_open_osfhandle(handle as isize, flags)) };
+    dbg!(handle, res);
+    if res == -1 {
+        Err(errno_err(vm))
+    } else {
+        Ok(res)
+    }
 }
 
 #[cfg(windows)]
-pub fn rust_file(raw_fileno: i64) -> File {
+pub fn rust_file(raw_fileno: i32, vm: &VirtualMachine) -> PyResult<File> {
     use std::os::windows::io::FromRawHandle;
+    extern "C" {
+        fn _get_osfhandle(fd: i32) -> isize /* intptr_t */;
+    }
+    let handle = unsafe { suppress_iph!(_get_osfhandle(raw_fileno)) };
+    dbg!(raw_fileno, handle);
+    if handle == -1 {
+        Err(errno_err(vm))
+    } else {
+        Ok(unsafe { File::from_raw_handle(raw_fileno as *mut ffi::c_void) })
+    }
+}
 
-    //This seems to work as expected but further testing is required.
-    unsafe { File::from_raw_handle(raw_fileno as *mut ffi::c_void) }
+#[cfg(windows)]
+pub fn forget_file(file: File) {
+    use std::os::windows::io::IntoRawHandle;
+    file.into_raw_handle();
 }
 
 #[cfg(all(not(unix), not(windows)))]
-pub fn rust_file(raw_fileno: i64) -> File {
+pub fn rust_file(raw_fileno: i32) -> File {
     unimplemented!();
 }
 
 #[cfg(all(not(unix), not(windows)))]
-pub fn raw_file_number(handle: File) -> i64 {
+pub fn raw_file_number(handle: File, flags: i32, vm: &VirtualMachine) -> PyResult<i32> {
+    unimplemented!();
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub fn forget_file(handle: File) {
     unimplemented!();
 }
 
@@ -89,11 +161,13 @@ fn make_path(_vm: &VirtualMachine, path: PyStringRef, dir_fd: &DirFd) -> PyStrin
     }
 }
 
-fn os_close(fileno: i64) {
-    //The File type automatically closes when it goes out of scope.
-    //To enable us to close these file descriptors (and hence prevent leaks)
-    //we seek to create the relevant File and simply let it pass out of scope!
-    rust_file(fileno);
+fn os_close(fileno: i32, vm: &VirtualMachine) -> PyResult<()> {
+    let res = unsafe { libc::close(fileno) };
+    if res == -1 {
+        Err(errno_err(vm))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -108,7 +182,7 @@ pub fn os_open(
     _mode: OptionalArg<PyIntRef>,
     dir_fd: OptionalArg<PyIntRef>,
     vm: &VirtualMachine,
-) -> PyResult<i64> {
+) -> PyResult<i32> {
     let dir_fd = DirFd {
         dir_fd: dir_fd.into_option(),
     };
@@ -150,7 +224,7 @@ pub fn os_open(
         .open(fname.as_str())
         .map_err(|err| convert_io_error(vm, err))?;
 
-    Ok(raw_file_number(handle))
+    raw_file_number(handle, flags as i32, vm)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -347,35 +421,35 @@ fn os_error(message: OptionalArg<PyStringRef>, vm: &VirtualMachine) -> PyResult 
     Err(vm.new_os_error(msg))
 }
 
-fn os_fsync(fd: i64, vm: &VirtualMachine) -> PyResult<()> {
-    let file = rust_file(fd);
+fn os_fsync(fd: i32, vm: &VirtualMachine) -> PyResult<()> {
+    let file = rust_file(fd, vm)?;
     file.sync_all().map_err(|err| convert_io_error(vm, err))?;
     // Avoid closing the fd
-    raw_file_number(file);
+    forget_file(file);
     Ok(())
 }
 
-fn os_read(fd: i64, n: usize, vm: &VirtualMachine) -> PyResult {
+fn os_read(fd: i32, n: usize, vm: &VirtualMachine) -> PyResult {
     let mut buffer = vec![0u8; n];
-    let mut file = rust_file(fd);
+    let mut file = rust_file(fd, vm)?;
     let n = file
         .read(&mut buffer)
         .map_err(|err| convert_io_error(vm, err))?;
     buffer.truncate(n);
 
     // Avoid closing the fd
-    raw_file_number(file);
+    forget_file(file);
     Ok(vm.ctx.new_bytes(buffer))
 }
 
-fn os_write(fd: i64, data: PyBytesLike, vm: &VirtualMachine) -> PyResult {
-    let mut file = rust_file(fd);
+fn os_write(fd: i32, data: PyBytesLike, vm: &VirtualMachine) -> PyResult {
+    let mut file = rust_file(fd, vm)?;
     let written = data
         .with_ref(|b| file.write(b))
         .map_err(|err| convert_io_error(vm, err))?;
 
     // Avoid closing the fd
-    raw_file_number(file);
+    forget_file(file);
     Ok(vm.ctx.new_int(written))
 }
 
@@ -692,7 +766,7 @@ fn to_seconds_from_nanos(secs: i64, nanos: i64) -> f64 {
 
 #[cfg(unix)]
 fn os_stat(
-    file: Either<PyStringRef, i64>,
+    file: Either<PyStringRef, i32>,
     dir_fd: DirFd,
     follow_symlinks: FollowSymlinks,
     vm: &VirtualMachine,
@@ -706,6 +780,11 @@ fn os_stat(
     #[cfg(target_os = "redox")]
     use std::os::redox::fs::MetadataExt;
 
+    let file = match file {
+        Either::A(s) => Either::A(s),
+        Either::B(fd) => Either::B(rust_file(fd, vm)?),
+    };
+
     let get_stats = move || -> io::Result<PyObjectRef> {
         let meta = match file {
             Either::A(path) => {
@@ -717,10 +796,9 @@ fn os_stat(
                     fs::symlink_metadata(path)?
                 }
             }
-            Either::B(fno) => {
-                let file = rust_file(fno);
+            Either::B(file) => {
                 let meta = file.metadata()?;
-                raw_file_number(file);
+                forget_file(file);
                 meta
             }
         };
@@ -766,12 +844,17 @@ fn attributes_to_mode(attr: u32) -> u32 {
 
 #[cfg(windows)]
 fn os_stat(
-    file: Either<PyStringRef, i64>,
+    file: Either<PyStringRef, i32>,
     _dir_fd: DirFd, // TODO: error
     follow_symlinks: FollowSymlinks,
     vm: &VirtualMachine,
 ) -> PyResult {
     use std::os::windows::fs::MetadataExt;
+
+    let file = match file {
+        Either::A(s) => Either::A(s),
+        Either::B(fd) => Either::B(rust_file(fd, vm)?),
+    };
 
     let get_stats = move || -> io::Result<PyObjectRef> {
         let meta = match file {
@@ -779,10 +862,9 @@ fn os_stat(
                 true => fs::metadata(path.as_str())?,
                 false => fs::symlink_metadata(path.as_str())?,
             },
-            Either::B(fno) => {
-                let f = rust_file(fno);
+            Either::B(f) => {
                 let meta = f.metadata()?;
-                raw_file_number(f);
+                forget_file(f);
                 meta
             }
         };
@@ -813,14 +895,14 @@ fn os_stat(
     windows
 )))]
 fn os_stat(
-    _file: Either<PyStringRef, i64>,
+    _file: Either<PyStringRef, i32>,
     _dir_fd: DirFd,
     _follow_symlinks: FollowSymlinks,
 ) -> PyResult {
     unimplemented!();
 }
 
-fn os_lstat(file: Either<PyStringRef, i64>, dir_fd: DirFd, vm: &VirtualMachine) -> PyResult {
+fn os_lstat(file: Either<PyStringRef, i32>, dir_fd: DirFd, vm: &VirtualMachine) -> PyResult {
     os_stat(
         file,
         dir_fd,
@@ -1195,47 +1277,6 @@ fn os_uname(vm: &VirtualMachine) -> PyResult {
 pub type Offset = libc::off_t;
 #[cfg(windows)]
 pub type Offset = libc::c_longlong;
-
-#[cfg(windows)]
-type InvalidParamHandler = extern "C" fn(
-    *const libc::wchar_t,
-    *const libc::wchar_t,
-    *const libc::wchar_t,
-    libc::c_uint,
-    libc::uintptr_t,
-);
-#[cfg(windows)]
-extern "C" {
-    fn _set_thread_local_invalid_parameter_handler(
-        pNew: InvalidParamHandler,
-    ) -> InvalidParamHandler;
-}
-
-#[cfg(windows)]
-extern "C" fn silent_iph_handler(
-    _: *const libc::wchar_t,
-    _: *const libc::wchar_t,
-    _: *const libc::wchar_t,
-    _: libc::c_uint,
-    _: libc::uintptr_t,
-) {
-}
-
-macro_rules! suppress_iph {
-    ($e:expr) => {{
-        #[cfg(windows)]
-        {
-            let old = _set_thread_local_invalid_parameter_handler(silent_iph_handler);
-            let ret = $e;
-            _set_thread_local_invalid_parameter_handler(old);
-            ret
-        }
-        #[cfg(not(windows))]
-        {
-            $e
-        }
-    }};
-}
 
 fn os_isatty(fd: i32) -> bool {
     unsafe { suppress_iph!(libc::isatty(fd)) != 0 }

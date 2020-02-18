@@ -537,7 +537,7 @@ mod fileio {
 
     fn file_io_init(
         file_io: PyObjectRef,
-        name: Either<PyStringRef, i64>,
+        name: Either<PyStringRef, i32>,
         mode: OptionalArg<PyStringRef>,
         vm: &VirtualMachine,
     ) -> PyResult {
@@ -570,13 +570,8 @@ mod fileio {
 
     fn fio_get_fileno(instance: &PyObjectRef, vm: &VirtualMachine) -> PyResult<fs::File> {
         io_base_checkclosed(instance.clone(), OptionalArg::Missing, vm)?;
-        let fileno = i64::try_from_object(vm, vm.get_attribute(instance.clone(), "__fileno")?)?;
-        Ok(os::rust_file(fileno))
-    }
-    fn fio_set_fileno(instance: &PyObjectRef, f: fs::File, vm: &VirtualMachine) -> PyResult<()> {
-        let updated = os::raw_file_number(f);
-        vm.set_attr(&instance, "__fileno", vm.ctx.new_int(updated))?;
-        Ok(())
+        let fileno = i32::try_from_object(vm, vm.get_attribute(instance.clone(), "__fileno")?)?;
+        os::rust_file(fileno, vm)
     }
 
     fn file_io_read(
@@ -602,7 +597,7 @@ mod fileio {
             bytes.truncate(n);
             bytes
         };
-        fio_set_fileno(&instance, handle, vm)?;
+        os::forget_file(handle);
 
         Ok(bytes)
     }
@@ -636,7 +631,7 @@ mod fileio {
             }
         };
 
-        fio_set_fileno(&instance, f.into_inner(), vm)?;
+        os::forget_file(f.into_inner());
 
         Ok(())
     }
@@ -652,7 +647,7 @@ mod fileio {
             .with_ref(|b| handle.write(b))
             .map_err(|e| os::convert_io_error(vm, e))?;
 
-        fio_set_fileno(&instance, handle, vm)?;
+        os::forget_file(handle);
 
         //return number of bytes written
         Ok(len)

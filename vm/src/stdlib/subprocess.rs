@@ -36,11 +36,11 @@ struct PopenArgs {
     #[pyarg(positional_only)]
     args: Either<PyStringRef, PyListRef>,
     #[pyarg(positional_or_keyword, default = "None")]
-    stdin: Option<i64>,
+    stdin: Option<i32>,
     #[pyarg(positional_or_keyword, default = "None")]
-    stdout: Option<i64>,
+    stdout: Option<i32>,
     #[pyarg(positional_or_keyword, default = "None")]
-    stderr: Option<i64>,
+    stderr: Option<i32>,
     #[pyarg(positional_or_keyword, default = "None")]
     close_fds: Option<bool>, // TODO: use these unused options
     #[pyarg(positional_or_keyword, default = "None")]
@@ -66,7 +66,7 @@ const NULL_DEVICE: &str = "nul";
 #[cfg(unix)]
 const NULL_DEVICE: &str = "/dev/null";
 
-fn convert_redirection(arg: Option<i64>, vm: &VirtualMachine) -> PyResult<subprocess::Redirection> {
+fn convert_redirection(arg: Option<i32>, vm: &VirtualMachine) -> PyResult<subprocess::Redirection> {
     match arg {
         Some(fd) => match fd {
             -1 => Ok(subprocess::Redirection::Pipe),
@@ -78,7 +78,7 @@ fn convert_redirection(arg: Option<i64>, vm: &VirtualMachine) -> PyResult<subpro
                 if fd < 0 {
                     Err(vm.new_value_error(format!("Invalid fd: {}", fd)))
                 } else {
-                    Ok(subprocess::Redirection::File(rust_file(fd)))
+                    Ok(subprocess::Redirection::File(rust_file(fd, vm)?))
                 }
             }
         },
@@ -86,12 +86,17 @@ fn convert_redirection(arg: Option<i64>, vm: &VirtualMachine) -> PyResult<subpro
     }
 }
 
-fn convert_to_file_io(file: &Option<File>, mode: String, vm: &VirtualMachine) -> PyResult {
+fn convert_to_file_io(
+    file: &Option<File>,
+    mode: String,
+    flags: i32,
+    vm: &VirtualMachine,
+) -> PyResult {
     match file {
         Some(ref stdin) => io_open(
             vm,
             vec![
-                vm.new_int(raw_file_number(stdin.try_clone().unwrap())),
+                vm.new_int(raw_file_number(stdin.try_clone().unwrap(), flags, vm)?),
                 vm.new_str(mode),
             ]
             .into(),
@@ -160,15 +165,30 @@ impl PopenRef {
     }
 
     fn stdin(self, vm: &VirtualMachine) -> PyResult {
-        convert_to_file_io(&self.process.borrow().stdin, "wb".to_owned(), vm)
+        convert_to_file_io(
+            &self.process.borrow().stdin,
+            "wb".to_owned(),
+            libc::O_WRONLY,
+            vm,
+        )
     }
 
     fn stdout(self, vm: &VirtualMachine) -> PyResult {
-        convert_to_file_io(&self.process.borrow().stdout, "rb".to_owned(), vm)
+        convert_to_file_io(
+            &self.process.borrow().stdout,
+            "rb".to_owned(),
+            libc::O_RDONLY,
+            vm,
+        )
     }
 
     fn stderr(self, vm: &VirtualMachine) -> PyResult {
-        convert_to_file_io(&self.process.borrow().stderr, "rb".to_owned(), vm)
+        convert_to_file_io(
+            &self.process.borrow().stderr,
+            "rb".to_owned(),
+            libc::O_RDONLY,
+            vm,
+        )
     }
 
     fn terminate(self, vm: &VirtualMachine) -> PyResult<()> {
